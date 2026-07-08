@@ -33,7 +33,6 @@ jobs:
             - name: WebSockets
           sketch-paths: |
             - snake_esp32
-          enable-warnings-report: true
 
   lint-python:
     name: Python (pont série optionnel)
