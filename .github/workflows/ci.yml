@@ -12,12 +12,10 @@ jobs:
     name: Compile (ESP32-S3)
     runs-on: ubuntu-latest
     steps:
-      # On checkout dans un dossier "snake_esp32" pour que le nom du dossier == nom du .ino
-      # (arduino-cli l'exige : sketch_dir/sketch_dir.ino)
+      # Le repo s'appelle "snake_esp32" et contient snake_esp32.ino à sa racine,
+      # donc le dossier de checkout porte déjà le même nom que le .ino (exigé par arduino-cli).
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: snake_esp32
 
       - name: Compile le sketch
         uses: arduino/compile-sketches@v1
@@ -32,7 +30,7 @@ jobs:
             - name: Adafruit BusIO
             - name: WebSockets
           sketch-paths: |
-            - snake_esp32
+            - ./
 
   lint-python:
     name: Python (pont série optionnel)
