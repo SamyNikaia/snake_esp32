@@ -1,0 +1,56 @@
+name: CI
+
+# Compile le firmware à chaque push / pull request. Pas de déploiement (pas de CD).
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:        # permet de lancer la CI à la main depuis l'onglet Actions
+
+jobs:
+  build:
+    name: Compile (ESP32-S3)
+    runs-on: ubuntu-latest
+    steps:
+      # On checkout dans un dossier "snake_esp32" pour que le nom du dossier == nom du .ino
+      # (arduino-cli l'exige : sketch_dir/sketch_dir.ino)
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: snake_esp32
+
+      - name: Compile le sketch
+        uses: arduino/compile-sketches@v1
+        with:
+          fqbn: esp32:esp32:esp32s3
+          platforms: |
+            - name: esp32:esp32
+              source-url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          libraries: |
+            - name: Adafruit GFX Library
+            - name: Adafruit SSD1306
+            - name: Adafruit BusIO
+            - name: WebSockets
+          sketch-paths: |
+            - snake_esp32
+          enable-warnings-report: true
+
+  lint-python:
+    name: Python (pont série optionnel)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Vérifie la syntaxe de snake_keys.py
+        run: |
+          if [ -f snake_keys.py ]; then
+            python -m py_compile snake_keys.py && echo "snake_keys.py OK"
+          else
+            echo "pas de script python, rien à vérifier"
+          fi
