@@ -1,63 +1,91 @@
-// Snake VERSUS 2 joueurs sur ESP32-S3 + écran OLED, tout en websocket.
-// Chaque joueur se co au wifi "SNAKE-BRIGADE" et ouvre http://192.168.4.1 sur son tel.
-// J1 = serpent plein, J2 = serpent en contour, pomme = petit point. Dernier en vie gagne.
-// (lib à installer : WebSockets de Markus Sattler)
+// =====================================================================
+//  SNAKE 2 JOUEURS  -  ESP32-S3 + petit écran OLED
+// =====================================================================
+// En gros : l'ESP32 fait tourner un Snake en versus à 2 joueurs.
+// Chaque joueur ouvre une page web sur son tel et dirige son serpent
+// avec les flèches, en temps réel grâce au websocket. Les deux serpents
+// s'affichent sur le même écran OLED.
+// J1 = serpent plein, J2 = serpent en contour, dernier en vie gagne.
+//
+// L'ESP32 essaie de rejoindre le wifi "decode-etudiants" ; s'il y arrive
+// pas, il crée son propre wifi de secours pour qu'on puisse jouer quand même.
+//
+// Seule lib à installer : "WebSockets" de Markus Sattler.
+// =====================================================================
 
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <WebSocketsServer.h>
+// ---------- Les librairies dont on a besoin ----------
+#include <Wire.h>               // pour parler à l'écran en I2C
+#include <Adafruit_GFX.h>       // le moteur de dessin (formes, texte...)
+#include <Adafruit_SSD1306.h>   // le pilote de notre écran OLED
+#include <WiFi.h>               // le wifi de l'ESP32
+#include <WebServer.h>          // pour héberger la page web
+#include <WebSocketsServer.h>   // pour recevoir les touches en direct
 
-#define USE_AP true
-const char* AP_SSID  = "SNAKE-BRIGADE";
-const char* AP_PASS  = "";
-const char* STA_SSID = "TON_WIFI";
-const char* STA_PASS = "TON_MOT_DE_PASSE";
+// ---------- Réglages du wifi ----------
+// USE_AP = false -> on rejoint un wifi qui existe déjà (mode STA).
+// USE_AP = true  -> l'ESP32 crée son propre wifi (mode point d'accès).
+#define USE_AP false
+const char* AP_SSID  = "SNAKE-BRIGADE";     // nom du wifi qu'on crée (secours)
+const char* AP_PASS  = "";                  // vide = pas de mot de passe
+const char* STA_SSID = "decode-etudiants";  // le wifi qu'on veut rejoindre
+const char* STA_PASS = "";                  // <-- ton mot de passe wifi ici
 
+// ---------- Réglages de l'écran OLED ----------
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 64
-#define OLED_ADDR 0x3C
-#define OLED_SDA 8
-#define OLED_SCL 9
+#define OLED_ADDR 0x3C          // l'adresse I2C de l'écran (0x3D si jamais ça marche pas)
+#define OLED_SDA 8              // les broches I2C. On les force parce que la S3
+#define OLED_SCL 9              // met pas l'I2C sur les mêmes broches qu'un ESP32 normal.
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-WebServer server(80);
-WebSocketsServer webSocket(81);
+// ---------- Les deux serveurs ----------
+WebServer        server(80);     // sert la page web (port 80, le classique)
+WebSocketsServer webSocket(81);  // reçoit les touches en temps réel (port 81)
 
-// cases de 4px, 8px réservés en haut pour le score -> plateau 32x14
+// ---------- La grille de jeu ----------
+// Une case fait 4 pixels. On garde 8px tout en haut pour afficher le score,
+// donc le terrain fait 32 cases de large sur 14 de haut.
 #define CELL 4
 #define TOPBAR 8
-#define GRID_W (SCREEN_WIDTH / CELL)
-#define GRID_H ((SCREEN_HEIGHT - TOPBAR) / CELL)
-#define MAX_LEN (GRID_W * GRID_H)
-#define MAXP 2
+#define GRID_W (SCREEN_WIDTH / CELL)          // 32
+#define GRID_H ((SCREEN_HEIGHT - TOPBAR) / CELL)  // 14
+#define MAX_LEN (GRID_W * GRID_H)             // taille max d'un serpent
+#define MAXP 2                                // nombre de joueurs max
 
+// ---------- Un joueur = un serpent ----------
+// Ça c'est tout ce qui décrit un serpent : où sont ses cases, sa direction,
+// son score, s'il est encore en vie, et à quel joueur il appartient.
 struct Player {
-  uint8_t bx[MAX_LEN], by[MAX_LEN];
-  int len;
-  int dx, dy, pdx, pdy;   // direction courante + celle demandée
+  uint8_t bx[MAX_LEN], by[MAX_LEN];  // les coordonnées de chaque bout du corps
+  int len;                           // sa longueur actuelle
+  int dx, dy, pdx, pdy;              // direction actuelle + direction demandée
   int score;
-  bool alive;             // en vie dans la manche en cours
-  bool connected;         // un client websocket occupe ce slot
-  int  wsNum;             // le client en question (-1 = personne)
+  bool alive;                        // vivant dans la manche en cours ?
+  bool connected;                    // un joueur est branché sur ce slot ?
+  int  wsNum;                        // le numéro de sa connexion websocket (-1 = personne)
 };
-Player P[MAXP];
+Player P[MAXP];   // nos deux joueurs
 
-int numRacers = 0;        // nb de serpents dans la manche
-int soloIdx = -1;         // si un seul joueur, lequel
-uint8_t foodX, foodY;
-bool paused, dirty;
+// ---------- Les variables globales du jeu ----------
+int numRacers = 0;        // combien de serpents dans la manche
+int soloIdx = -1;         // si on joue tout seul, c'est quel joueur
+uint8_t foodX, foodY;     // position de la pomme
+bool paused, dirty;       // en pause ? / faut-il redessiner l'écran ?
 unsigned long lastMove = 0;
-unsigned long moveInterval = 130;
+unsigned long moveInterval = 130;  // temps entre 2 déplacements (plus petit = plus rapide)
 
+// Les 3 états possibles du jeu :
+// LOBBY = on attend les joueurs, PLAYING = on joue, RESULT = fin de manche.
 enum GState { LOBBY, PLAYING, RESULT };
 GState state = LOBBY;
-String resultText = "";
-String statusText = "";
-String netName, ipStr;
+String resultText = "";   // le texte affiché en fin de manche
+String statusText = "";   // le texte de score envoyé aux pages web
+String netName, ipStr;    // le nom du wifi + l'IP à ouvrir (affichés à l'écran)
 
+// ---------- La page web ----------
+// En gros c'est toute la page (HTML + style + JavaScript) que l'ESP32 balance
+// au navigateur quand on ouvre son IP. Le JS capte les flèches et les boutons
+// tactiles, et envoie la touche à l'ESP32 par le websocket.
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="fr"><head>
 <meta charset="utf-8">
@@ -126,13 +154,18 @@ document.querySelectorAll('button[data-k]').forEach(b=>{
 </script></body></html>
 )HTML";
 
+// ---------- Petites fonctions utilitaires ----------
+// Quand le navigateur demande la page "/", on lui renvoie tout le HTML.
 void handleRoot() { server.send_P(200, "text/html", INDEX_HTML); }
+// Envoyer un message à toutes les pages / à une page précise.
 void wsBroadcast(const String& s) { webSocket.broadcastTXT(s.c_str(), s.length()); }
 void wsSend(uint8_t num, const String& s) { webSocket.sendTXT(num, s.c_str(), s.length()); }
-
+// Combien de joueurs sont branchés en ce moment.
 int connectedCount() { int c = 0; for (int i = 0; i < MAXP; i++) if (P[i].connected) c++; return c; }
 
-// construit le texte d'état et l'envoie à toutes les pages
+// ---------- Le texte d'état envoyé aux pages ----------
+// En gros ça fabrique la petite phrase de score/état ("P1 3  P2 5", "Égalité !"...)
+// et l'envoie à toutes les pages web pour qu'elles l'affichent.
 void updateStatus() {
   String t;
   if (state == LOBBY)       t = "En attente (" + String(connectedCount()) + "/2) - appuie sur une fleche";
@@ -147,6 +180,8 @@ void updateStatus() {
   wsBroadcast("info:" + t);
 }
 
+// ---------- Placer la pomme ----------
+// On tire une case au hasard, et on recommence tant qu'elle tombe sur un serpent.
 void placeFood() {
   bool bad;
   do {
@@ -160,13 +195,16 @@ void placeFood() {
   } while (bad);
 }
 
+// ---------- Faire apparaître un serpent au début de la manche ----------
+// J1 démarre en haut à gauche et va à droite, J2 en bas à droite et va à gauche.
+// Comme ça ils partent chacun dans leur coin et se foncent un peu dessus.
 void spawnPlayer(int i) {
   P[i].len = 3;
-  if (i == 0) {                       // J1 démarre en haut à gauche, va à droite
+  if (i == 0) {
     int hx = 5, hy = 3;
     for (int k = 0; k < 3; k++) { P[i].bx[k] = hx - k; P[i].by[k] = hy; }
     P[i].dx = 1; P[i].dy = 0;
-  } else {                            // J2 démarre en bas à droite, va à gauche
+  } else {
     int hx = GRID_W - 6, hy = GRID_H - 4;
     for (int k = 0; k < 3; k++) { P[i].bx[k] = hx + k; P[i].by[k] = hy; }
     P[i].dx = -1; P[i].dy = 0;
@@ -176,14 +214,17 @@ void spawnPlayer(int i) {
   P[i].alive = true;
 }
 
+// ---------- Démarrer une manche ----------
+// On fait apparaître un serpent pour chaque joueur branché, on pose la pomme,
+// et on passe en mode "on joue".
 void startRound() {
   numRacers = 0; soloIdx = -1;
   for (int i = 0; i < MAXP; i++) {
     if (P[i].connected) { spawnPlayer(i); numRacers++; soloIdx = i; }
     else { P[i].alive = false; P[i].len = 0; }
   }
-  if (numRacers == 0) return;         // personne de branché, on reste en lobby
-  if (numRacers >= 2) soloIdx = -1;
+  if (numRacers == 0) return;         // si personne n'est branché, on reste au lobby
+  if (numRacers >= 2) soloIdx = -1;   // à 2 joueurs, pas de "solo"
   moveInterval = 130;
   paused = false;
   placeFood();
@@ -193,91 +234,105 @@ void startRound() {
   updateStatus();
 }
 
+// ---------- Changer la direction d'un serpent ----------
+// On refuse le demi-tour direct, sinon le serpent se rentre dedans tout seul.
 void setPlayerDir(int i, int nx, int ny) {
-  if (P[i].len > 1 && nx == -P[i].dx && ny == -P[i].dy) return;  // pas de demi-tour
+  if (P[i].len > 1 && nx == -P[i].dx && ny == -P[i].dy) return;
   P[i].pdx = nx; P[i].pdy = ny;
 }
 
+// ---------- Traiter une touche reçue ----------
+// i = quel joueur a appuyé, c = la touche. Ça c'est le "cerveau" des commandes.
 void applyCommand(int i, char c) {
-  if (i < 0) return;                  // spectateur, il regarde et c'est tout
-  if (c == 'P') { if (state == PLAYING) { paused = !paused; dirty = true; } return; }
-  if (c == 'X' || c == ' ') { if (state != PLAYING) startRound(); return; }
+  if (i < 0) return;                  // un spectateur : il regarde, il joue pas
+  if (c == 'P') { if (state == PLAYING) { paused = !paused; dirty = true; } return; }   // pause
+  if (c == 'X' || c == ' ') { if (state != PLAYING) startRound(); return; }             // rejouer
 
+  // les flèches -> une direction
   int nx = 0, ny = 0;
   switch (c) {
     case 'U': ny = -1; break;
     case 'D': ny =  1; break;
     case 'L': nx = -1; break;
     case 'R': nx =  1; break;
-    default: return;
+    default: return;                  // touche inconnue, on ignore
   }
-  if (state != PLAYING) startRound();
+  if (state != PLAYING) startRound();  // si on jouait pas, appuyer sur une flèche lance la partie
   setPlayerDir(i, nx, ny);
   dirty = true;
 }
 
-// la tête du joueur i tape-t-elle un corps (le sien sauf sa tête, ou l'autre) ?
+// ---------- Détecter si un serpent se cogne ----------
+// La tête du joueur i tape-t-elle un corps (le sien, sauf sa propre tête, ou l'autre serpent) ?
 bool headCollides(int i, bool wallDead[]) {
   int hx = P[i].bx[0], hy = P[i].by[0];
   for (int j = 0; j < MAXP; j++) {
-    if (!P[j].alive || wallDead[j]) continue;
-    int start = (j == i) ? 1 : 0;
+    if (!P[j].alive || wallDead[j]) continue;   // on ignore les serpents déjà morts
+    int start = (j == i) ? 1 : 0;               // pour soi-même, on saute sa propre tête
     for (int k = start; k < P[j].len; k++)
       if (P[j].bx[k] == hx && P[j].by[k] == hy) return true;
   }
   return false;
 }
 
+// ---------- Fin de manche : on désigne le gagnant ----------
 void endRound() {
   state = RESULT;
   paused = false;
   if (numRacers < 2) {
-    resultText = "Game over";
+    resultText = "Game over";                   // en solo, y'a pas de gagnant
   } else {
+    // on compte qui est encore en vie
     int aliveCount = 0, last = -1;
     for (int i = 0; i < MAXP; i++) if (P[i].alive) { aliveCount++; last = i; }
     int win;
-    if (aliveCount == 1) win = last;                    // survivant = vainqueur
-    else win = (P[0].score > P[1].score) ? 0 : (P[1].score > P[0].score ? 1 : -1);
+    if (aliveCount == 1) win = last;            // s'il reste un survivant, c'est lui le boss
+    else win = (P[0].score > P[1].score) ? 0 : (P[1].score > P[0].score ? 1 : -1);  // sinon on départage au score
     resultText = (win < 0) ? "Egalite !" : ("Joueur " + String(win + 1) + " gagne !");
   }
   dirty = true;
   updateStatus();
 }
 
+// ---------- Le cœur du jeu : un tour de jeu ----------
+// Appelé toutes les "moveInterval" ms. C'est là que tout se passe : on bouge
+// les serpents, on gère les collisions, la bouffe, et on regarde si c'est fini.
 void step() {
-  bool wallDead[MAXP] = {false, false};
-  bool overlap[MAXP]  = {false, false};
-  bool grows[MAXP]    = {false, false};
-  int nhx[MAXP], nhy[MAXP];
+  bool wallDead[MAXP] = {false, false};   // qui est mort contre un mur
+  bool overlap[MAXP]  = {false, false};   // qui s'est cogné dans un corps
+  bool grows[MAXP]    = {false, false};   // qui va manger la pomme ce tour
+  int nhx[MAXP], nhy[MAXP];               // la future position de chaque tête
 
-  // 1. intentions + morts contre les murs
+  // 1) On calcule où va chaque tête, et on repère les morts contre les murs.
   for (int i = 0; i < MAXP; i++) {
     if (!P[i].alive) continue;
-    P[i].dx = P[i].pdx; P[i].dy = P[i].pdy;
+    P[i].dx = P[i].pdx; P[i].dy = P[i].pdy;   // on valide la direction demandée
     nhx[i] = P[i].bx[0] + P[i].dx;
     nhy[i] = P[i].by[0] + P[i].dy;
     if (nhx[i] < 0 || nhx[i] >= GRID_W || nhy[i] < 0 || nhy[i] >= GRID_H) wallDead[i] = true;
     else grows[i] = (nhx[i] == foodX && nhy[i] == foodY);
   }
 
-  // 2. on avance les serpents qui n'ont pas mordu un mur
+  // 2) On fait avancer les serpents qui n'ont pas mordu un mur.
+  //    (on décale tout le corps d'un cran, la tête prend la nouvelle case)
   for (int i = 0; i < MAXP; i++) {
     if (!P[i].alive || wallDead[i]) continue;
     int lim = (P[i].len < MAX_LEN - 1) ? P[i].len : MAX_LEN - 1;
     for (int k = lim; k > 0; k--) { P[i].bx[k] = P[i].bx[k-1]; P[i].by[k] = P[i].by[k-1]; }
     P[i].bx[0] = nhx[i]; P[i].by[0] = nhy[i];
-    if (grows[i] && P[i].len < MAX_LEN) P[i].len++;
+    if (grows[i] && P[i].len < MAX_LEN) P[i].len++;   // s'il mange, il grandit (on garde la queue)
   }
 
-  // 3. collisions entre corps (une fois tout le monde déplacé) -> gère le choc frontal
+  // 3) Maintenant que tout le monde a bougé, on check les collisions entre corps.
+  //    Petit piège : faut le faire APRÈS le déplacement, sinon le choc frontal
+  //    (les deux têtes sur la même case) serait pas détecté correctement.
   for (int i = 0; i < MAXP; i++)
     if (P[i].alive && !wallDead[i]) overlap[i] = headCollides(i, wallDead);
 
-  // 4. on applique les morts
+  // 4) On applique les morts (mur OU collision).
   for (int i = 0; i < MAXP; i++) if (wallDead[i] || overlap[i]) P[i].alive = false;
 
-  // 5. pomme + score pour les survivants qui ont mangé
+  // 5) La pomme : le survivant qui l'a mangée marque un point, et on accélère un peu.
   bool ate = false;
   for (int i = 0; i < MAXP; i++)
     if (P[i].alive && grows[i]) { P[i].score++; ate = true; if (moveInterval > 60) moveInterval -= 2; }
@@ -285,27 +340,34 @@ void step() {
 
   dirty = true;
 
-  // 6. fin de manche ? (à 2 : dès qu'il reste 1 vivant ; en solo : quand le seul meurt)
+  // 6) C'est fini ? À 2 joueurs dès qu'il reste 1 vivant (l'autre a perdu),
+  //    en solo quand le seul serpent meurt.
   int aliveCount = 0;
   for (int i = 0; i < MAXP; i++) if (P[i].alive) aliveCount++;
   bool over = (numRacers >= 2) ? (aliveCount <= 1) : (aliveCount == 0);
   if (over) endRound();
 }
 
+// ---------- Dessiner un serpent ----------
+// La tête est toujours pleine. Pour le corps : J1 est plein, J2 est en contour,
+// comme ça on distingue les deux même sur un écran noir et blanc.
 void drawSnake(int i) {
   for (int k = 0; k < P[i].len; k++) {
     int px = P[i].bx[k] * CELL, py = TOPBAR + P[i].by[k] * CELL;
-    if (k == 0)      display.fillRect(px, py, CELL, CELL, SSD1306_WHITE);          // tête pleine
-    else if (i == 0) display.fillRect(px, py, CELL - 1, CELL - 1, SSD1306_WHITE);  // J1 corps plein
-    else             display.drawRect(px, py, CELL, CELL, SSD1306_WHITE);          // J2 corps en contour
+    if (k == 0)      display.fillRect(px, py, CELL, CELL, SSD1306_WHITE);
+    else if (i == 0) display.fillRect(px, py, CELL - 1, CELL - 1, SSD1306_WHITE);
+    else             display.drawRect(px, py, CELL, CELL, SSD1306_WHITE);
   }
 }
 
+// ---------- Tout l'affichage de l'écran ----------
+// Selon l'état du jeu, on dessine soit le lobby, soit l'écran de fin, soit la partie.
 void draw() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
+  // Écran d'attente : on montre le wifi, l'IP à ouvrir et le nombre de joueurs.
   if (state == LOBBY) {
     display.setCursor(28, 2);  display.print(F("SNAKE 2P"));
     display.setCursor(2, 16);  display.print(F("WiFi: ")); display.print(netName);
@@ -316,6 +378,7 @@ void draw() {
     return;
   }
 
+  // Écran de fin : le gagnant + les scores.
   if (state == RESULT) {
     display.setCursor(4, 8);   display.print(resultText);
     display.setCursor(4, 26);
@@ -326,16 +389,19 @@ void draw() {
     return;
   }
 
-  // barre de score
+  // Sinon on est en pleine partie.
+  // La barre de score en haut :
   display.setCursor(0, 0);
   if (numRacers >= 2) { display.print(F("P1:")); display.print(P[0].score); display.print(F(" P2:")); display.print(P[1].score); }
   else                { display.print(F("Score: ")); display.print(P[soloIdx < 0 ? 0 : soloIdx].score); }
 
-  // pomme = petit point au centre de sa case
+  // La pomme : un petit point au centre de sa case (pour pas la confondre avec un serpent).
   display.fillRect(foodX * CELL + 1, TOPBAR + foodY * CELL + 1, CELL - 2, CELL - 2, SSD1306_WHITE);
 
+  // Les serpents vivants.
   for (int i = 0; i < MAXP; i++) if (P[i].alive) drawSnake(i);
 
+  // Le petit "PAUSE" par-dessus si on est en pause.
   if (paused) {
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
     display.setCursor(49, 32); display.print(F("PAUSE"));
@@ -344,65 +410,127 @@ void draw() {
   display.display();
 }
 
+// ---------- Gérer les places (slots) des joueurs ----------
+// Chaque connexion websocket a un numéro. Là on fait le lien numéro <-> joueur.
 int slotOf(int num)  { for (int i = 0; i < MAXP; i++) if (P[i].connected && P[i].wsNum == num) return i; return -1; }
+// On donne la première place libre à un nouveau joueur (-1 si la partie est pleine).
 int assignSlot(int num) {
   for (int i = 0; i < MAXP; i++)
     if (!P[i].connected) { P[i].connected = true; P[i].wsNum = num; P[i].alive = false; P[i].len = 0; return i; }
-  return -1;   // partie pleine
+  return -1;
 }
+// Quand quelqu'un se déconnecte, on libère sa place.
 void freeSlot(int num) { int i = slotOf(num); if (i >= 0) { P[i].connected = false; P[i].wsNum = -1; P[i].alive = false; } }
 
+// ---------- Les événements du websocket ----------
+// Appelé automatiquement quand un joueur se connecte, se déconnecte, ou envoie une touche.
 void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t len) {
   switch (type) {
-    case WStype_CONNECTED: {
+    case WStype_CONNECTED: {                       // un joueur arrive
       int slot = assignSlot(num);
-      wsSend(num, "you:" + String(slot < 0 ? 0 : slot + 1));
-      updateStatus();                     // met à jour le compteur de joueurs partout
+      wsSend(num, "you:" + String(slot < 0 ? 0 : slot + 1));   // on lui dit s'il est J1, J2 ou spectateur
+      updateStatus();                              // et on rafraîchit le compteur pour tout le monde
       dirty = true;
       break;
     }
-    case WStype_DISCONNECTED:
+    case WStype_DISCONNECTED:                       // un joueur part
       freeSlot(num);
       updateStatus();
       dirty = true;
       break;
-    case WStype_TEXT:
+    case WStype_TEXT:                               // un joueur appuie sur une touche
       if (len > 0) applyCommand(slotOf(num), (char)payload[0]);
       break;
     default: break;
   }
 }
 
+// ---------- Outils de diagnostic wifi ----------
+// Donne un nom lisible au type de sécurité d'un réseau.
+const char* authName(wifi_auth_mode_t a) {
+  switch (a) {
+    case WIFI_AUTH_OPEN:            return "OUVERT";
+    case WIFI_AUTH_WEP:             return "WEP";
+    case WIFI_AUTH_WPA_PSK:         return "WPA";
+    case WIFI_AUTH_WPA2_PSK:        return "WPA2 (mot de passe)";
+    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2 (mot de passe)";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-ENTERPRISE (login+mdp)";
+    case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3";
+    default:                        return "?";
+  }
+}
+
+// Liste dans le moniteur série tous les réseaux 2.4GHz que l'ESP32 voit.
+// (Rappel : l'ESP32 capte QUE le 2.4GHz, jamais le 5GHz.)
+void scanAndPrint() {
+  int n = WiFi.scanNetworks();
+  if (n <= 0) { Serial.println("  (aucun reseau 2.4GHz vu)"); return; }
+  for (int i = 0; i < n; i++) {
+    Serial.print("  "); Serial.print(WiFi.SSID(i));
+    Serial.print("  RSSI="); Serial.print(WiFi.RSSI(i));
+    Serial.print("  "); Serial.println(authName(WiFi.encryptionType(i)));
+  }
+}
+
+// ---------- Le démarrage (une seule fois au boot) ----------
 void setup() {
   Serial.begin(115200);
   Wire.begin(OLED_SDA, OLED_SCL);
+  // On allume l'écran. periphBegin=false : sinon la lib relance l'I2C sur les
+  // mauvaises broches et l'écran disparaît (le fameux piège de la S3).
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, true, false)) {
     Serial.println("pas d'écran ?!");
     while (true) delay(1000);
   }
 
+  // On remet les deux joueurs à zéro (personne de branché au départ).
   for (int i = 0; i < MAXP; i++) { P[i].connected = false; P[i].wsNum = -1; P[i].alive = false; P[i].len = 0; }
 
-  if (USE_AP) {
-    WiFi.mode(WIFI_AP);
-    if (strlen(AP_PASS) > 0) WiFi.softAP(AP_SSID, AP_PASS); else WiFi.softAP(AP_SSID);
-    netName = AP_SSID; ipStr = WiFi.softAPIP().toString();
-  } else {
+  // On affiche un écran TOUT DE SUITE, avant de tenter le wifi.
+  // (parce que la connexion wifi peut bloquer plusieurs secondes, et pendant
+  //  ce temps l'écran resterait noir sinon)
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE); display.setTextSize(1);
+  display.setCursor(20, 4);  display.print(F("SNAKE 2P VERSUS"));
+  display.setCursor(2, 30);  display.print(F("Connexion wifi..."));
+  display.setCursor(2, 44);  display.print(USE_AP ? AP_SSID : STA_SSID);
+  display.display();
+
+  // On essaie de rejoindre le wifi de la fac. Si au bout de 12s c'est pas
+  // connecté, on abandonne et on affiche les réseaux vus (pour comprendre pourquoi).
+  bool staOk = false;
+  if (!USE_AP) {
     WiFi.mode(WIFI_STA);
     WiFi.begin(STA_SSID, STA_PASS);
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(250);
-    netName = STA_SSID;
-    ipStr = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("WiFi KO");
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) { delay(250); Serial.print("."); }
+    staOk = (WiFi.status() == WL_CONNECTED);
+    if (!staOk) {
+      Serial.println("\n[!] " + String(STA_SSID) + " injoignable. Reseaux 2.4GHz visibles :");
+      scanAndPrint();
+    }
   }
-  Serial.println("http://" + ipStr);
 
+  // Si le wifi a marché on l'utilise, sinon on crée notre propre wifi de secours.
+  if (staOk) {
+    netName = STA_SSID; ipStr = WiFi.localIP().toString();
+  } else {
+    if (!USE_AP) Serial.println("[i] Bascule en point d'acces de secours (" + String(AP_SSID) + ").");
+    WiFi.mode(WIFI_AP);
+    if (strlen(AP_PASS) > 0) WiFi.softAP(AP_SSID, AP_PASS); else WiFi.softAP(AP_SSID);
+    netName = AP_SSID; ipStr = WiFi.softAPIP().toString();
+  }
+  Serial.println("Reseau: " + netName + "  ->  http://" + ipStr);
+
+  // On lance les deux serveurs (la page web + le websocket).
   server.on("/", handleRoot);
   server.begin();
   webSocket.begin();
   webSocket.onEvent(onWsEvent);
-  randomSeed(esp_random());
+  randomSeed(esp_random());   // pour que la pomme tombe vraiment au hasard
 
+  // Petit écran d'accueil avec le wifi et l'adresse à ouvrir.
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE); display.setTextSize(1);
   display.setCursor(20, 4);  display.print(F("SNAKE 2P VERSUS"));
@@ -411,18 +539,23 @@ void setup() {
   display.display();
   delay(2500);
 
+  // Et on part sur l'écran d'attente.
   state = LOBBY;
   updateStatus();
   dirty = true;
 }
 
+// ---------- La boucle principale (tourne en continu) ----------
 void loop() {
-  server.handleClient();
-  webSocket.loop();
+  server.handleClient();   // on répond aux pages web
+  webSocket.loop();        // on écoute les touches
 
+  // Si on joue et qu'il est temps, on avance le jeu d'un cran.
   if (state == PLAYING && !paused && millis() - lastMove >= moveInterval) {
     lastMove = millis();
     step();
   }
+
+  // On redessine l'écran seulement si quelque chose a changé (sinon ça rame pour rien).
   if (dirty) { draw(); dirty = false; }
 }
